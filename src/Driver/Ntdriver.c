@@ -13,6 +13,8 @@
 
 #include "TCdefs.h"
 #include <ntddk.h>
+#include <initguid.h>
+#include <Ntddstor.h>
 #include "Crypto.h"
 #include "Fat.h"
 #include "Tests.h"
@@ -3379,6 +3381,8 @@ LPWSTR TCTranslateCode (ULONG ulCode)
 		return (LPWSTR) _T ("IOCTL_STORAGE_CHECK_PRIORITY_HINT_SUPPORT");
 	else if (ulCode == IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES)
 		return (LPWSTR) _T ("IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES");
+	else if (ulCode == IOCTL_DISK_GROW_PARTITION)
+		return (LPWSTR) _T ("IOCTL_DISK_GROW_PARTITION");
 	else if (ulCode == IRP_MJ_READ)
 		return (LPWSTR) _T ("IRP_MJ_READ");
 	else if (ulCode == IRP_MJ_WRITE)
@@ -4940,7 +4944,7 @@ BOOL IsOSAtLeast (OSVersionEnum reqMinOS)
 		>= (major << 16 | minor << 8));
 }
 
-NTSTATUS NTAPI KeSaveExtendedProcessorState (
+NTSTATUS NTAPI KeSaveExtendedProcessorStateVC (
     __in ULONG64 Mask,
     PXSTATE_SAVE XStateSave
     )
@@ -4955,7 +4959,7 @@ NTSTATUS NTAPI KeSaveExtendedProcessorState (
 	}
 }
 
-VOID NTAPI KeRestoreExtendedProcessorState (
+VOID NTAPI KeRestoreExtendedProcessorStateVC (
 	PXSTATE_SAVE XStateSave
 	)
 {

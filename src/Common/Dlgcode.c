@@ -22,13 +22,13 @@
 #include <io.h>
 #include <math.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <time.h>
 #include <tchar.h>
 #include <Richedit.h>
 #if defined (TCMOUNT) || defined (VOLFORMAT)
-#include <Shlwapi.h>
 #include <process.h>
 #include <Tlhelp32.h>
 #endif
@@ -106,6 +106,15 @@ LOCAL_DEFINE_GUID(PARTITION_LDM_METADATA_GUID,   0x5808C8AAL, 0x7E8F, 0x42E0, 0x
 LOCAL_DEFINE_GUID(PARTITION_LDM_DATA_GUID,       0xAF9B60A0L, 0x1431, 0x4F62, 0xBC, 0x68, 0x33, 0x11, 0x71, 0x4A, 0x69, 0xAD);    // Logical Disk Manager data partition
 LOCAL_DEFINE_GUID(PARTITION_MSFT_RECOVERY_GUID,  0xDE94BBA4L, 0x06D1, 0x4D40, 0xA1, 0x6A, 0xBF, 0xD5, 0x01, 0x79, 0xD6, 0xAC);    // Microsoft recovery partition
 LOCAL_DEFINE_GUID(PARTITION_CLUSTER_GUID, 	   0xdb97dba9L, 0x0840, 0x4bae, 0x97, 0xf0, 0xff, 0xb9, 0xa3, 0x27, 0xc7, 0xe1);    // Cluster metadata partition
+
+#ifndef PROCESSOR_ARCHITECTURE_ARM64
+#define PROCESSOR_ARCHITECTURE_ARM64            12
+#endif
+
+#ifndef IMAGE_FILE_MACHINE_ARM64
+#define IMAGE_FILE_MACHINE_ARM64 0xAA64
+#endif
+
 
 using namespace VeraCrypt;
 
@@ -226,7 +235,8 @@ static std::vector<HostDevice> rawHostDeviceList;
 CRITICAL_SECTION csSecureDesktop;
 
 /* Boolean that indicates if our Secure Desktop is active and being used or not */
-BOOL bSecureDesktopOngoing = FALSE;
+volatile BOOL bSecureDesktopOngoing = FALSE;
+TCHAR SecureDesktopName[65];
 
 HINSTANCE hInst = NULL;
 HCURSOR hCursor = NULL;
@@ -335,6 +345,13 @@ typedef LSTATUS (STDAPICALLTYPE *SHDeleteKeyWPtr)(HKEY hkey, LPCWSTR pszSubKey);
 
 typedef HRESULT (STDAPICALLTYPE *SHStrDupWPtr)(LPCWSTR psz, LPWSTR *ppwsz);
 
+typedef HRESULT (STDAPICALLTYPE *UrlUnescapeWPtr)(
+  PWSTR pszUrl,
+  PWSTR pszUnescaped,
+  DWORD *pcchUnescaped,
+  DWORD dwFlags
+);
+
 // ChangeWindowMessageFilter
 typedef BOOL (WINAPI *ChangeWindowMessageFilterPtr) (UINT, DWORD);
 
@@ -363,6 +380,7 @@ SetupInstallFromInfSectionWPtr SetupInstallFromInfSectionWFn = NULL;
 SetupOpenInfFileWPtr SetupOpenInfFileWFn = NULL;
 SHDeleteKeyWPtr SHDeleteKeyWFn = NULL;
 SHStrDupWPtr SHStrDupWFn = NULL;
+UrlUnescapeWPtr UrlUnescapeWFn = NULL;
 ChangeWindowMessageFilterPtr ChangeWindowMessageFilterFn = NULL;
 CreateProcessWithTokenWFn CreateProcessWithTokenWPtr = NULL;
 
@@ -3091,10 +3109,11 @@ void InitApp (HINSTANCE hInstance, wchar_t *lpszCommandLine)
 	if (!SetupCloseInfFileFn || !SetupDiOpenClassRegKeyFn || !SetupInstallFromInfSectionWFn || !SetupOpenInfFileWFn)
 		AbortProcess ("INIT_DLL");
 
-	// Get SHDeleteKeyW function pointer
+	// Get SHDeleteKeyW,SHStrDupW, UrlUnescapeW functions pointers
 	SHDeleteKeyWFn = (SHDeleteKeyWPtr) GetProcAddress (hShlwapiDll, "SHDeleteKeyW");
 	SHStrDupWFn = (SHStrDupWPtr) GetProcAddress (hShlwapiDll, "SHStrDupW");
-	if (!SHDeleteKeyWFn || !SHStrDupWFn)
+	UrlUnescapeWFn = (UrlUnescapeWPtr) GetProcAddress(hShlwapiDll, "UrlUnescapeW");
+	if (!SHDeleteKeyWFn || !SHStrDupWFn || !UrlUnescapeWFn)
 		AbortProcess ("INIT_DLL");
 
 	if (IsOSAtLeast (WIN_VISTA))
@@ -4409,7 +4428,7 @@ static int DriverLoad ()
 	else
 		*tmp = 0;
 
-	StringCbCatW (driverPath, sizeof(driverPath), !Is64BitOs () ? L"\\veracrypt.sys" : L"\\veracrypt-x64.sys");
+	StringCbCatW (driverPath, sizeof(driverPath), !Is64BitOs () ? L"\\veracrypt.sys" : IsARM()? L"\\veracrypt-arm64.sys" : L"\\veracrypt-x64.sys");
 
 	file = FindFirstFile (driverPath, &find);
 
@@ -10753,30 +10772,94 @@ BOOL IsOSVersionAtLeast (OSVersionEnum reqMinOS, int reqMinServicePack)
 }
 
 
-BOOL Is64BitOs ()
+BOOL Is64BitOs()
 {
 #ifdef _WIN64
 	return TRUE;
 #else
-    static BOOL isWow64 = FALSE;
+	static BOOL isWow64 = FALSE;
 	static BOOL valid = FALSE;
-	typedef BOOL (__stdcall *LPFN_ISWOW64PROCESS ) (HANDLE hProcess,PBOOL Wow64Process);
+	typedef BOOL(__stdcall* LPFN_ISWOW64PROCESS) (HANDLE hProcess, PBOOL Wow64Process);
+	typedef BOOL(__stdcall* LPFN_ISWOW64PROCESS2)(
+		HANDLE hProcess,
+		USHORT* pProcessMachine,
+		USHORT* pNativeMachine
+		);
 	LPFN_ISWOW64PROCESS fnIsWow64Process;
+	LPFN_ISWOW64PROCESS2 fnIsWow64Process2;
 
 	if (valid)
 		return isWow64;
 
-	fnIsWow64Process = (LPFN_ISWOW64PROCESS) GetProcAddress (GetModuleHandle(L"kernel32"), "IsWow64Process");
+	fnIsWow64Process = (LPFN_ISWOW64PROCESS)GetProcAddress(GetModuleHandle(L"kernel32"), "IsWow64Process");
+	fnIsWow64Process2 = (LPFN_ISWOW64PROCESS2)GetProcAddress(GetModuleHandle(L"kernel32"), "IsWow64Process2");
 
-    if (fnIsWow64Process != NULL)
-        if (!fnIsWow64Process (GetCurrentProcess(), &isWow64))
+	if (fnIsWow64Process2)
+	{
+		USHORT processMachine, nativeMachine;
+		if (!fnIsWow64Process2(GetCurrentProcess(), &processMachine, &nativeMachine))
 			isWow64 = FALSE;
-
+		else
+		{
+			if (IMAGE_FILE_MACHINE_ARM64 == nativeMachine || IMAGE_FILE_MACHINE_AMD64 == nativeMachine || IMAGE_FILE_MACHINE_IA64 == nativeMachine || IMAGE_FILE_MACHINE_ALPHA64 == nativeMachine)
+				isWow64 = TRUE;
+		}
+}
+	else if (fnIsWow64Process != NULL)
+	{
+		if (!fnIsWow64Process(GetCurrentProcess(), &isWow64))
+			isWow64 = FALSE;
+	}
 	valid = TRUE;
-    return isWow64;
+	return isWow64;
 #endif
 }
 
+BOOL IsARM()
+{
+#if defined(_M_ARM) || defined(_M_ARM64)
+	return TRUE;
+#else
+	static BOOL isARM = FALSE;
+	static BOOL valid = FALSE;
+	typedef BOOL(__stdcall* LPFN_ISWOW64PROCESS2)(
+		HANDLE hProcess,
+		USHORT* pProcessMachine,
+		USHORT* pNativeMachine
+		);
+	LPFN_ISWOW64PROCESS2 fnIsWow64Process2;
+
+	if (valid)
+		return isARM;
+
+	fnIsWow64Process2 = (LPFN_ISWOW64PROCESS2)GetProcAddress(GetModuleHandle(L"kernel32"), "IsWow64Process2");
+	if (fnIsWow64Process2)
+	{
+		USHORT processMachine, nativeMachine;
+		if (fnIsWow64Process2(GetCurrentProcess(), &processMachine, &nativeMachine))
+		{
+			if (IMAGE_FILE_MACHINE_ARM64 == nativeMachine || IMAGE_FILE_MACHINE_AMD64 == nativeMachine || IMAGE_FILE_MACHINE_IA64 == nativeMachine || IMAGE_FILE_MACHINE_ALPHA64 == nativeMachine)
+				isARM = TRUE;
+			else
+				isARM = FALSE;
+			valid = TRUE;
+		}
+	}
+
+	if (!valid)
+	{
+		SYSTEM_INFO systemInfo;
+		GetNativeSystemInfo(&systemInfo);
+		if (systemInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM || systemInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64)
+			isARM = TRUE;
+		else
+			isARM = FALSE;
+	}
+	valid = TRUE;
+	return isARM;
+
+#endif
+}
 
 BOOL IsServerOS ()
 {
@@ -10946,7 +11029,7 @@ std::wstring GetWindowsEdition ()
 		osname += L"-basic";
 
 	if (Is64BitOs())
-		osname += L"-x64";
+		osname += IsARM()? L"-arm64" : L"-x64";
 
 	if (CurrentOSServicePack > 0)
 	{
@@ -11117,15 +11200,33 @@ void Applink (const char *dest)
 		CorrectURL (url);
 	}
 
-	if (IsAdmin ())
+	if (IsOSAtLeast (WIN_VISTA) && IsAdmin ())
 	{
-		if (buildUrl && !FileExists (url))
+		int openDone = 0;
+		if (buildUrl)
 		{
-			// fallbacl to online resources
-			StringCbPrintfW (url, sizeof (url), L"https://www.veracrypt.fr/en/%s", page);
-			SafeOpenURL (url);
+			wchar_t pageFileName [TC_MAX_PATH] = {0};
+			DWORD cchUnescaped = ARRAYSIZE(pageFileName);
+
+			StringCbCopyW (pageFileName, sizeof(pageFileName), page);
+			/* remove escape sequences from the page name before calling FileExists function */
+			if (S_OK == UrlUnescapeWFn (pageFileName, pageFileName, &cchUnescaped, URL_UNESCAPE_INPLACE))
+			{
+				std::wstring pageFullPath = installDir;
+				pageFullPath += L"docs\\html\\en\\";
+				pageFullPath += pageFileName;
+			
+				if (!FileExists (pageFullPath.c_str()))
+				{
+					// fallback to online resources
+					StringCbPrintfW (url, sizeof (url), L"https://www.veracrypt.fr/en/%s", page);
+					SafeOpenURL (url);
+					openDone = 1;
+				}
+			}
 		}
-		else
+
+		if (!openDone)
 		{
 			SafeOpenURL (url);
 		}
@@ -11136,7 +11237,7 @@ void Applink (const char *dest)
 
 		if (((r == ERROR_FILE_NOT_FOUND) || (r == ERROR_PATH_NOT_FOUND)) && buildUrl)
 		{
-			// fallbacl to online resources
+			// fallback to online resources
 			StringCbPrintfW (url, sizeof (url), L"https://www.veracrypt.fr/en/%s", page);
 			ShellExecuteW (NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
 		}			
@@ -12123,6 +12224,35 @@ BOOL CALLBACK SecurityTokenKeyfileDlgProc (HWND hwndDlg, UINT msg, WPARAM wParam
 	return 0;
 }
 
+extern "C" BOOL IsThreadInSecureDesktop(DWORD dwThreadID)
+{
+	BOOL bRet = FALSE;
+	if (bSecureDesktopOngoing)
+	{
+		HDESK currentDesk = GetThreadDesktop (dwThreadID);
+		if (currentDesk)
+		{
+			LPWSTR szName = NULL;
+			DWORD dwLen = 0;
+			if (!GetUserObjectInformation (currentDesk, UOI_NAME, NULL, 0, &dwLen))
+			{
+				szName = (LPWSTR) malloc (dwLen);
+				if (szName)
+				{
+					if (GetUserObjectInformation (currentDesk, UOI_NAME, szName, dwLen, &dwLen))
+					{
+						if (0 == _wcsicmp (szName, SecureDesktopName))
+							bRet = TRUE;
+					}
+					free (szName);
+				}
+			}
+		}
+	}
+
+	return bRet;
+}
+
 
 BOOL InitSecurityTokenLibrary (HWND hwndDlg)
 {
@@ -12147,6 +12277,8 @@ BOOL InitSecurityTokenLibrary (HWND hwndDlg)
 				HWND hParent = IsWindow (m_hwnd)? m_hwnd : GetActiveWindow();
 				if (!hParent)
 					hParent = GetForegroundWindow ();
+				if (IsThreadInSecureDesktop(GetCurrentThreadId()) && !IsThreadInSecureDesktop(GetWindowThreadProcessId(hParent, NULL)))
+					hParent = GetActiveWindow ();
 				if (SecureDesktopDialogBoxParam (hInst, MAKEINTRESOURCEW (IDD_TOKEN_PASSWORD), hParent, (DLGPROC) SecurityTokenPasswordDlgProc, (LPARAM) &str) == IDCANCEL)
 					throw UserAbort (SRC_POS);
 			}
@@ -13756,7 +13888,7 @@ INT_PTR SecureDesktopDialogBoxParam(
 	INT_PTR retValue = 0;
 	BOOL bEffectiveUseSecureDesktop = bCmdUseSecureDesktopValid? bCmdUseSecureDesktop : bUseSecureDesktop;
 
-	if (bEffectiveUseSecureDesktop)
+	if (bEffectiveUseSecureDesktop && !IsThreadInSecureDesktop(GetCurrentThreadId()))
 	{
 		EnterCriticalSection (&csSecureDesktop);
 		bSecureDesktopOngoing = TRUE;
@@ -13802,6 +13934,8 @@ INT_PTR SecureDesktopDialogBoxParam(
 				HANDLE hThread = ::CreateThread (NULL, 0, SecureDesktopThread, (LPVOID) &param, 0, NULL);
 				if (hThread)
 				{
+					StringCbCopy(SecureDesktopName, sizeof (SecureDesktopName), szDesktopName);
+
 					WaitForSingleObject (hThread, INFINITE);
 					CloseHandle (hThread);
 
@@ -15007,7 +15141,11 @@ BOOL GetHibernateStatus (BOOL& bHibernateEnabled, BOOL& bHiberbootEnabled)
 				}
 
 				// check if Fast Startup / Hybrid Boot is enabled
-				if (IsOSVersionAtLeast (WIN_8, 0) && spc.spare2[0])
+#if _MSC_VER >= 1900
+				if (IsOSVersionAtLeast (WIN_8, 0) && spc.Hiberboot)
+#else
+				if (IsOSVersionAtLeast(WIN_8, 0) && spc.spare2[0])
+#endif
 				{
 					dwHiberbootEnabled = 1;
 					ReadLocalMachineRegistryDword (L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power", L"HiberbootEnabled", &dwHiberbootEnabled);
